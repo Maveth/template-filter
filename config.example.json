@@ -1,0 +1,49 @@
+{
+  "upstream": "http://127.0.0.1:8332",
+  "profiles": [
+    {
+      "name": "strict",
+      "listen": "0.0.0.0:8336",
+      "filters": {
+        "rejectfakeoutputs": true,
+        "rejectdeadbranches": true,
+        "rejectbareenvelopes": true,
+        "rejectfakemultisig": true,
+        "rejecttokenmessages": true,
+        "rejectrunestones": true,
+        "rejectcounterparty": true,
+        "rejectstamps": true,
+        "rejectparasites": true,
+        "permitbaremultisig": false,
+        "permitbarepubkey": false,
+        "datacarrier": false,
+        "datacarriersize": 0,
+        "dust_sat_per_kvb": null,
+        "minfeerate_sat_vb": null,
+        "blockmaxweight": null
+      }
+    },
+    {
+      "name": "open",
+      "listen": "0.0.0.0:8337",
+      "filters": {
+        "rejectfakeoutputs": false,
+        "rejectdeadbranches": false,
+        "rejectbareenvelopes": false,
+        "rejectfakemultisig": false,
+        "rejecttokenmessages": false,
+        "rejectrunestones": false,
+        "rejectcounterparty": false,
+        "rejectstamps": false,
+        "rejectparasites": false,
+        "permitbaremultisig": true,
+        "permitbarepubkey": true,
+        "datacarrier": true,
+        "datacarriersize": null,
+        "dust_sat_per_kvb": null,
+        "minfeerate_sat_vb": null,
+        "blockmaxweight": null
+      }
+    }
+  ]
+}
