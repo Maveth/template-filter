@@ -1,6 +1,6 @@
 # template-filter
 
-A block-template filter that sits between a mining gateway and a Bitcoin node.
+A block-template filter that sits between a mining gateway and a Bitcoin node. Released under the [MIT license](LICENSE).
 
 The node keeps its mempool. The gateway keeps its own block builder. This program only changes the template the gateway asked for.
 
