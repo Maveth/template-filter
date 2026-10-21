@@ -1,0 +1,19 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['main', 'master']
+    paths-ignore: ['*.md']
+  pull_request:
+    paths-ignore: ['*.md']
+    branches: ['main', 'master']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.event.pull_request.draft == false
+    uses: Start9Labs/start-technologies/.github/workflows/build.yml@master

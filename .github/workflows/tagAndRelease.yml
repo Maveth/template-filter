@@ -1,0 +1,52 @@
+name: Tag and Release
+
+on:
+  push:
+    branches: ['main', 'master']
+    paths-ignore: ['*.md']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    uses: Start9Labs/start-technologies/.github/workflows/build.yml@master
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download s9pk artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: template-filter_*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: filter_0.1.0_1
+          name: 'Template Filter StartOS #filter:0.1.0:1'
+          body: |
+            Sideload for StartOS 0.4. Sits between Datum Gateway and Bitcoin.
+
+            | File | Use on |
+            |------|--------|
+            | template-filter_aarch64.s9pk | Raspberry Pi / ARM |
+            | template-filter_x86_64.s9pk | Intel/AMD |
+
+            Install Bitcoin and Datum first, then sideload this package.
+            Set Datum's Bitcoin RPC URL to this service's filter address.
+          files: dist/*.s9pk
+          make_latest: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -72,6 +72,14 @@ A transaction that does not parse is kept. The filter will not drop something it
 
 Two Plumb details are narrower here. A wrapped multisig is dropped when it pushes more than 10 pubkeys. The filter does not check which keys a signature proves. A taproot key that is not on the curve is not checked.
 
+## StartOS 0.4
+
+This repo also builds a sideload package for StartOS 0.4. It does not install on StartOS 0.3.
+
+The service depends on Bitcoin and Datum Gateway both running. It calls Bitcoin for templates and listens for Datum. Leave the node host blank to use Bitcoin on the same server, port 8332. A port such as 65495 is the LAN port StartOS assigned on one server, not the default. Set Datum's Bitcoin RPC URL to this service's filter address, port 8336 unless you change it.
+
+GitHub Actions builds `template-filter_aarch64.s9pk` and `template-filter_x86_64.s9pk` and attaches them to a release.
+
 ## Run
 
 Python 3.11 or newer. No packages beyond the standard library.

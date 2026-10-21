@@ -9,6 +9,7 @@ cannot be rebuilt safely, the node's original answer is returned.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import traceback
 import urllib.request
@@ -19,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from filtercore import tx_reject_reason, witness_commitment_hex
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "config.json"
+CONFIG_PATH = Path(os.environ.get("TEMPLATE_FILTER_CONFIG", ROOT / "config.json"))
 
 
 def load_config() -> dict:
