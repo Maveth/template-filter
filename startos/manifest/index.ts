@@ -33,7 +33,7 @@ export const manifest = setupManifest({
       optional: false,
       metadata: {
         title: 'Bitcoin',
-        icon: 'https://raw.githubusercontent.com/Start9Labs/bitcoin-knots-startos/master/icon.svg',
+        icon: 'https://raw.githubusercontent.com/Start9Labs/bitcoin-knots-startos/master/dep-icon.svg',
       },
     },
     datum: {
