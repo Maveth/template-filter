@@ -33,10 +33,10 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: filter_0.1.0_1
-          name: 'Template Filter StartOS #filter:0.1.0:1'
+          tag_name: filter_0.1.0_2
+          name: 'Template Filter StartOS #filter:0.1.0:2'
           body: |
-            Sideload for StartOS 0.4. Sits between Datum Gateway and Bitcoin.
+            Sideload for StartOS 0.4. Depends on Bitcoin Knots `#knots:29.4.2:4` or newer, and on Datum Gateway.
 
             | File | Use on |
             |------|--------|
