@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from filtercore import take_refill, tx_reject_reason, weight_ceiling, witness_commitment_hex
+from filtercore import clamp_template_request, take_refill, tx_reject_reason, weight_ceiling, witness_commitment_hex
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("TEMPLATE_FILTER_CONFIG", ROOT / "config.json"))
@@ -68,8 +68,7 @@ def _augment_request(payload: dict, flags: dict) -> dict:
         return payload
     if isinstance(flags.get("minfeerate_sat_vb"), (int, float)):
         req["minfeerate"] = flags["minfeerate_sat_vb"]
-    if isinstance(flags.get("blockmaxweight"), int):
-        req["blockmaxweight"] = flags["blockmaxweight"]
+    req = clamp_template_request(req, flags)
     out = dict(payload)
     out["params"] = [req] + list(params[1:])
     return out
@@ -93,7 +92,13 @@ def _filter_template(result: dict, flags: dict) -> tuple[dict, dict]:
             raw = bytes.fromhex(data)
         except ValueError:
             continue
-        reason = tx_reject_reason(raw, flags)
+        reason = tx_reject_reason(
+            raw,
+            flags,
+            fee=tx.get("fee") if isinstance(tx.get("fee"), int) else None,
+            weight=tx.get("weight") if isinstance(tx.get("weight"), int) else None,
+            sigops=tx.get("sigops") if isinstance(tx.get("sigops"), int) else None,
+        )
         if reason:
             drop[i] = True
             reasons[reason] = reasons.get(reason, 0) + 1

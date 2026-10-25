@@ -120,6 +120,8 @@ def _script_spam(script: bytes, as_output: bool, flags: dict) -> Optional[str]:
                     push, off = _push_len(script, off)
                     total += push
                     off += push
+                if flags.get("datacarrierfullcount"):
+                    total = max(0, len(script) - 1)
                 if total > limit:
                     return "datacarriersize"
             except ValueError:
@@ -157,6 +159,8 @@ def _script_spam(script: bytes, as_output: bool, flags: dict) -> Optional[str]:
                 return "deadbranch"
             if flags.get("rejectdeadbranches") and op == 0x63 and off >= 2 and script[off - 2] == 0x00:
                 return "deadbranch"
+            if flags.get("rejecttokens") and op == 0x63 and off >= 2 and script[off - 2] == 0x00 and b"\x03ord" in script[:80]:
+                return "token"
     except ValueError:
         return None
     return None
@@ -212,7 +216,66 @@ def _witness_script(items: list[bytes]) -> Optional[bytes]:
     return stack[-1]
 
 
-def tx_reject_reason(raw: bytes, flags: dict) -> Optional[str]:
+def _legacy_sigops(script: bytes) -> int:
+    count = 0
+    off = 0
+    while off < len(script):
+        op = script[off]
+        if 0 < op <= 0x4E:
+            push, off = _push_len(script, off)
+            off += push
+            continue
+        off += 1
+        if op in (0xAC, 0xAD):
+            count += 1
+        elif op in (0xAE, 0xAF):
+            count += 20
+    return count
+
+
+def _datacarrier_bytes(script: bytes, fullcount: bool) -> int:
+    if not script or script[0] != 0x6A:
+        return 0
+    if fullcount:
+        return max(0, len(script) - 1)
+    total = 0
+    off = 1
+    while off < len(script):
+        push, off = _push_len(script, off)
+        total += push
+        off += push
+    return total
+
+
+CONSENSUS_MAX_BLOCK_WEIGHT = 4_000_000
+CONSENSUS_MAX_BLOCK_SIGOPS = 80_000
+ANCHOR_SCRIPT = bytes.fromhex("51024e73")
+
+
+def clamp_template_request(req: dict, flags: dict) -> dict:
+    """Copy Knots block limits onto the template request, never above consensus."""
+    out = dict(req)
+    weight = flags.get("blockmaxweight")
+    if isinstance(weight, int) and weight > 0:
+        out["blockmaxweight"] = min(weight, CONSENSUS_MAX_BLOCK_WEIGHT)
+    size = flags.get("blockmaxsize")
+    if isinstance(size, int) and size > 0:
+        out["blockmaxsize"] = min(size, CONSENSUS_MAX_BLOCK_WEIGHT)
+    reserved_weight = flags.get("blockreservedweight")
+    if isinstance(reserved_weight, int) and reserved_weight >= 0:
+        cap = out.get("blockmaxweight", CONSENSUS_MAX_BLOCK_WEIGHT)
+        out["blockreservedweight"] = min(reserved_weight, cap)
+    reserved_size = flags.get("blockreservedsize")
+    if isinstance(reserved_size, int) and reserved_size >= 0:
+        cap = out.get("blockmaxsize", CONSENSUS_MAX_BLOCK_WEIGHT)
+        out["blockreservedsize"] = min(reserved_size, cap)
+    reserved_sigops = flags.get("blockreservedsigops")
+    if isinstance(reserved_sigops, int) and reserved_sigops >= 0:
+        out["blockreservedsigops"] = min(reserved_sigops, CONSENSUS_MAX_BLOCK_SIGOPS)
+    return out
+
+
+def tx_reject_reason(raw: bytes, flags: dict, fee: int | None = None, weight: int | None = None, sigops: int | None = None) -> Optional[str]:
     """Return a short reason to drop this tx, or None to keep it."""
     if not raw or len(raw) < 10:
         return None
@@ -258,8 +321,11 @@ def tx_reject_reason(raw: bytes, flags: dict) -> Optional[str]:
         dust_rate = flags.get("dust_sat_per_kvb")
         if isinstance(dust_rate, int) and dust_rate > 0:
             for value, script in outputs:
+                if flags.get("permitephemeral") is True and value == 0 and script == ANCHOR_SCRIPT:
+                    continue
                 if value < _dust_threshold(script, dust_rate):
                     return "dust"
+        witness_scripts = []
         lock_off = off
         if segwit:
             for _ in range(vin):
@@ -271,6 +337,7 @@ def tx_reject_reason(raw: bytes, flags: dict) -> Optional[str]:
                     off += item_len
                 script = _witness_script(items)
                 if script is not None:
+                    witness_scripts.append(script)
                     reason = _script_spam(script, False, flags)
                     if reason:
                         return reason
@@ -283,6 +350,35 @@ def tx_reject_reason(raw: bytes, flags: dict) -> Optional[str]:
             locktime = int.from_bytes(raw[lock_off:lock_off + 4], "little")
             if locktime == 21:
                 return "parasite"
+        scripts = [script for _value, script in outputs] + input_scripts + witness_scripts
+        limit = flags.get("maxscriptsize")
+        if isinstance(limit, int) and limit >= 0:
+            for script in scripts:
+                if len(script) > limit:
+                    return "scriptsize"
+        legacy_limit = flags.get("maxtxlegacysigops")
+        if isinstance(legacy_limit, int) and legacy_limit >= 0:
+            legacy = sum(_legacy_sigops(script) for script in input_scripts)
+            legacy += sum(_legacy_sigops(script) for _value, script in outputs)
+            if legacy > legacy_limit:
+                return "legacysigops"
+        if flags.get("permitbaredatacarrier") is False and outputs and all(script[:1] == b"\x6a" for _value, script in outputs):
+            return "baredatacarrier"
+        if flags.get("permitbareanchor") is False and outputs and all(script == ANCHOR_SCRIPT for _value, script in outputs):
+            return "bareanchor"
+        per_sigop = flags.get("bytespersigop")
+        if isinstance(per_sigop, int) and per_sigop > 0 and isinstance(sigops, int) and sigops > 0:
+            vsize = max(1, int(weight) // 4) if isinstance(weight, int) and weight > 0 else len(raw)
+            if vsize < sigops * per_sigop:
+                return "bytespersigop"
+        cost = flags.get("datacarriercost")
+        rate = flags.get("minfeerate_sat_vb")
+        if isinstance(cost, int) and cost > 0 and isinstance(rate, (int, float)) and isinstance(fee, int) and isinstance(weight, int):
+            data_bytes = sum(_datacarrier_bytes(script, bool(flags.get("datacarrierfullcount"))) for _value, script in outputs)
+            if data_bytes:
+                effective_vsize = (weight + data_bytes * cost) / 4
+                if fee < rate * effective_vsize:
+                    return "datacarriercost"
     except (ValueError, IndexError):
         return None
     return None

@@ -1,10 +1,10 @@
 import { VersionInfo } from '@start9labs/start-sdk'
 
 export const current = VersionInfo.of({
-  version: '#filter:0.2.0:0',
+  version: '#filter:0.3.0:0',
   releaseNotes: {
     en_US:
-      'After a template is filtered, ask the node to fill the freed space and serve that fuller template on the same tip. The first answer is still the filtered template. A new block starts over. The added transactions stay inside the weight, byte, and sigop limits.',
+      'Add the Knots policy checks a bare node would skip: data-carrier cost and full counting, bare data carriers, bare anchors, inscription tokens, bytes per sigop, legacy sigop count, and max script size. Block weight, size, and reserved limits can be set lower and are clamped to consensus.',
   },
   migrations: {
     up: async () => {},

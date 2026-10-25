@@ -3,7 +3,7 @@
 import hashlib
 import unittest
 
-from filtercore import take_refill, tx_reject_reason, weight_ceiling, witness_commitment_hex
+from filtercore import clamp_template_request, take_refill, tx_reject_reason, weight_ceiling, witness_commitment_hex
 
 FLAGS = {
     "rejectfakeoutputs": True,
@@ -82,6 +82,30 @@ class FilterTests(unittest.TestCase):
         signature = b"\x30" + b"\x00" * 48 + b"\x75" + b"\x00" * 14
         self.assertEqual(len(signature), 64)
         self.assertIsNone(tx_reject_reason(self._segwit([signature]), FLAGS))
+
+    def test_knots_policy_checks(self):
+        op_return = b"\x6a\x04" + b"data"
+        self.assertEqual(tx_reject_reason(tx_one_in_one_out(op_return), {"permitbaredatacarrier": False}), "baredatacarrier")
+        anchor = bytes.fromhex("51024e73")
+        self.assertEqual(tx_reject_reason(tx_one_in_one_out(anchor), {"permitbareanchor": False}), "bareanchor")
+        long_script = b"\x6a" + b"\x4c" + bytes([80]) + b"x" * 80
+        self.assertEqual(tx_reject_reason(tx_one_in_one_out(long_script), {"maxscriptsize": 10}), "scriptsize")
+        self.assertEqual(
+            tx_reject_reason(tx_one_in_one_out(b"\x00\x14" + bytes(range(20))), {"bytespersigop": 20}, weight=80, sigops=5),
+            "bytespersigop",
+        )
+        self.assertEqual(
+            tx_reject_reason(
+                tx_one_in_one_out(op_return),
+                {"datacarriercost": 4, "minfeerate_sat_vb": 1},
+                fee=1,
+                weight=400,
+            ),
+            "datacarriercost",
+        )
+        capped = clamp_template_request({}, {"blockmaxweight": 9_000_000, "blockreservedsigops": 90_000})
+        self.assertEqual(capped["blockmaxweight"], 4_000_000)
+        self.assertEqual(capped["blockreservedsigops"], 80_000)
 
     def test_refill_stops_at_the_ceiling(self):
         self.assertEqual(weight_ceiling(800000), 792000)
