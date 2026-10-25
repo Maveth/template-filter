@@ -179,6 +179,39 @@ def _dust_threshold(script: bytes, sat_per_kvb: int) -> int:
     return fee
 
 
+def _is_taproot_control_block(item: bytes) -> bool:
+    """BIP341 tapscript control block: 33 + 32*n bytes, leaf version 0xc0."""
+    if len(item) < 33 or (len(item) - 33) % 32:
+        return False
+    return (item[0] & 0xFE) == 0xC0
+
+
+def _witness_script(items: list[bytes]) -> Optional[bytes]:
+    """The witness item that is a script, or None when the witness has no script.
+
+    Signatures and public keys are not scripts. Parsing them flags ordinary
+    spends when those bytes happen to contain OP_DROP or OP_0 OP_IF.
+    """
+    if not items:
+        return None
+    stack = items
+    if stack[-1][:1] == b"\x50":
+        stack = stack[:-1]
+    if not stack:
+        return None
+    if len(stack) >= 2 and _is_taproot_control_block(stack[-1]):
+        return stack[-2]
+    if len(stack) == 1:
+        # A lone 64 or 65 byte item is a Taproot key-path signature.
+        if len(stack[0]) in (64, 65):
+            return None
+        return stack[0]
+    if len(stack) == 2 and len(stack[1]) in (33, 65):
+        # P2WPKH, and P2SH-P2WPKH: signature then pubkey.
+        return None
+    return stack[-1]
+
+
 def tx_reject_reason(raw: bytes, flags: dict) -> Optional[str]:
     """Return a short reason to drop this tx, or None to keep it."""
     if not raw or len(raw) < 10:
@@ -231,11 +264,14 @@ def tx_reject_reason(raw: bytes, flags: dict) -> Optional[str]:
         if segwit:
             for _ in range(vin):
                 stack_n, off = _read_varint(raw, off)
+                items = []
                 for _k in range(stack_n):
                     item_len, off = _read_varint(raw, off)
-                    item = raw[off:off + item_len]
+                    items.append(raw[off:off + item_len])
                     off += item_len
-                    reason = _script_spam(item, False, flags)
+                script = _witness_script(items)
+                if script is not None:
+                    reason = _script_spam(script, False, flags)
                     if reason:
                         return reason
             lock_off = off

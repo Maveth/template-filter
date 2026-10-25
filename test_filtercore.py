@@ -54,6 +54,35 @@ class FilterTests(unittest.TestCase):
         script = b"\x00\x14" + bytes(range(20))
         self.assertEqual(tx_reject_reason(tx_one_in_one_out(script, locktime=21), FLAGS), "parasite")
 
+    def _segwit(self, witness):
+        out_script = b"\x00\x14" + bytes(range(20))
+        raw = b"\x01\x00\x00\x00\x00\x01"
+        raw += b"\x01" + b"\x22" * 32 + b"\x00\x00\x00\x00" + b"\x00" + b"\xff\xff\xff\xff"
+        raw += b"\x01" + (1000).to_bytes(8, "little") + bytes([len(out_script)]) + out_script
+        raw += bytes([len(witness)])
+        for item in witness:
+            raw += bytes([len(item)]) + item
+        raw += b"\x00\x00\x00\x00"
+        return raw
+
+    def test_p2wpkh_signature_not_parsed_as_script(self):
+        # 0x30 is also PUSHBYTES_48, so byte 49 is read as an opcode.
+        signature = b"\x30" + b"\x00" * 48 + b"\x75" + b"\x01"
+        pubkey = b"\x02" + b"\x11" * 32
+        self.assertIsNone(tx_reject_reason(self._segwit([signature, pubkey]), FLAGS))
+
+    def test_p2wsh_envelope_still_dropped(self):
+        self.assertEqual(tx_reject_reason(self._segwit([b"\x75"]), FLAGS), "bareenvelope")
+
+    def test_tapscript_envelope_still_dropped(self):
+        control = b"\xc0" + b"\x33" * 32
+        self.assertEqual(tx_reject_reason(self._segwit([b"\x75", control]), FLAGS), "bareenvelope")
+
+    def test_taproot_keypath_signature_kept(self):
+        signature = b"\x30" + b"\x00" * 48 + b"\x75" + b"\x00" * 14
+        self.assertEqual(len(signature), 64)
+        self.assertIsNone(tx_reject_reason(self._segwit([signature]), FLAGS))
+
     def test_commitment_shape(self):
         wtxid = "11" * 32
         commit = witness_commitment_hex([wtxid])
