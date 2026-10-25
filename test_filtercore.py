@@ -3,7 +3,7 @@
 import hashlib
 import unittest
 
-from filtercore import tx_reject_reason, witness_commitment_hex
+from filtercore import take_refill, tx_reject_reason, weight_ceiling, witness_commitment_hex
 
 FLAGS = {
     "rejectfakeoutputs": True,
@@ -82,6 +82,33 @@ class FilterTests(unittest.TestCase):
         signature = b"\x30" + b"\x00" * 48 + b"\x75" + b"\x00" * 14
         self.assertEqual(len(signature), 64)
         self.assertIsNone(tx_reject_reason(self._segwit([signature]), FLAGS))
+
+    def test_refill_stops_at_the_ceiling(self):
+        self.assertEqual(weight_ceiling(800000), 792000)
+        kept = [{"txid": "aa", "weight": 100}]
+        candidates = [
+            {"txid": "bb", "weight": 50, "depends_txids": []},
+            {"txid": "cc", "weight": 1000, "depends_txids": []},
+            {"txid": "dd", "weight": 40, "depends_txids": ["bb"]},
+            {"txid": "ee", "weight": 40, "depends_txids": ["zz"]},
+            {"txid": "aa", "weight": 100, "depends_txids": []},
+        ]
+        filled = take_refill(kept, candidates, ceiling=200, banned={"bb"})
+        self.assertEqual([tx["txid"] for tx in filled], ["aa"])
+        allowed = [
+            {"txid": "bb", "weight": 50, "depends_txids": []},
+            {"txid": "dd", "weight": 40, "depends_txids": ["bb"]},
+            {"txid": "cc", "weight": 1000, "depends_txids": []},
+        ]
+        filled = take_refill(kept, allowed, ceiling=200, banned=set())
+        self.assertEqual([tx["txid"] for tx in filled], ["aa", "bb", "dd"])
+        self.assertLessEqual(sum(tx["weight"] for tx in filled), 200)
+        wide = [{"txid": "aa", "weight": 10, "data": "aa"}]
+        huge = [{"txid": "hh", "weight": 10, "data": "bb" * 50, "depends_txids": []}]
+        self.assertEqual(
+            [tx["txid"] for tx in take_refill(wide, huge, 100, set(), size_ceiling=20)],
+            ["aa"],
+        )
 
     def test_commitment_shape(self):
         wtxid = "11" * 32

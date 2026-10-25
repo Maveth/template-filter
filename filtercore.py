@@ -304,3 +304,62 @@ def witness_commitment_hex(wtxid_hexes: list[str]) -> str:
         level = [_sha256d(level[i] + level[i + 1]) for i in range(0, len(level), 2)]
     commit = _sha256d(level[0] + (b"\x00" * 32))
     return "6a24aa21a9ed" + commit.hex()
+
+
+# Knots default -blockreservedweight. The coinbase has to fit under weightlimit.
+COINBASE_RESERVE_WEIGHT = 8000
+
+
+def weight_ceiling(weightlimit: int, reserve: int = COINBASE_RESERVE_WEIGHT) -> int:
+    if weightlimit <= reserve:
+        return 0
+    return weightlimit - reserve
+
+
+def tx_vsize_bytes(tx: dict) -> int:
+    data = tx.get("data")
+    if isinstance(data, str):
+        return len(data) // 2
+    return 0
+
+
+def take_refill(
+    kept: list,
+    candidates: list,
+    ceiling: int,
+    banned: set,
+    size_ceiling: int | None = None,
+    sigop_ceiling: int | None = None,
+) -> list:
+    """Append candidates that pass the first filter's ban and still fit.
+
+    `candidates` are in the node's order. A candidate is skipped when it was
+    filtered, when a parent is missing, or when it would pass a block limit.
+    """
+    have = {tx["txid"] for tx in kept}
+    out = list(kept)
+    total = sum(int(tx["weight"]) for tx in kept)
+    total_size = sum(tx_vsize_bytes(tx) for tx in kept)
+    total_sigops = sum(int(tx.get("sigops") or 0) for tx in kept)
+    for tx in candidates:
+        txid = tx["txid"]
+        if txid in have or txid in banned:
+            continue
+        parents = tx.get("depends_txids") or []
+        if any(parent not in have for parent in parents):
+            continue
+        weight = int(tx["weight"])
+        size = tx_vsize_bytes(tx)
+        sigops = int(tx.get("sigops") or 0)
+        if total + weight > ceiling:
+            continue
+        if size_ceiling is not None and total_size + size > size_ceiling:
+            continue
+        if sigop_ceiling is not None and total_sigops + sigops > sigop_ceiling:
+            continue
+        out.append(tx)
+        have.add(txid)
+        total += weight
+        total_size += size
+        total_sigops += sigops
+    return out

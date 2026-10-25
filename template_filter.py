@@ -11,16 +11,26 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
 import traceback
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from filtercore import tx_reject_reason, witness_commitment_hex
+from filtercore import take_refill, tx_reject_reason, weight_ceiling, witness_commitment_hex
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("TEMPLATE_FILTER_CONFIG", ROOT / "config.json"))
+RESTORE_PATH = ROOT / "run" / "priority-restore.json"
+COINBASE_SIZE_RESERVE = 1000
+COINBASE_SIGOP_RESERVE = 400
+_state_lock = threading.Lock()
+_priority_lock = threading.Lock()
+_best: dict[tuple, dict] = {}
+_inflight: set[tuple] = set()
+_settled: set[tuple] = set()
 
 
 def load_config() -> dict:
@@ -138,6 +148,235 @@ def _filter_template(result: dict, flags: dict) -> tuple[dict, dict]:
     return out, {"dropped": len(txs) - len(kept), "fee_sats": fee_dropped, "reasons": reasons, "kept": len(kept)}
 
 
+def _template_weight(result: dict) -> int:
+    return sum(int(tx.get("weight") or 0) for tx in result.get("transactions") or [])
+
+
+def _choose_template(name: str, prevhash: str | None, filtered: dict) -> dict:
+    if not prevhash:
+        return filtered
+    with _state_lock:
+        best = _best.get((name, prevhash))
+    if best is None or _template_weight(best) < _template_weight(filtered):
+        return filtered
+    return best
+
+
+def _rpc_call(url: str, auth: str | None, method: str, params: list) -> object:
+    body = json.dumps({"jsonrpc": "1.0", "id": "refill", "method": method, "params": params}).encode()
+    headers = {"Content-Type": "application/json"}
+    if auth:
+        headers["Authorization"] = auth
+    status, raw, _ctype = _rpc(url, body, headers, 180)
+    if status != 200:
+        raise RuntimeError(f"upstream status {status}")
+    msg = json.loads(raw.decode("utf-8"))
+    if msg.get("error"):
+        raise RuntimeError(str(msg["error"])[:200])
+    return msg.get("result")
+
+
+def _write_restore(deltas: list[tuple[str, int]]) -> None:
+    RESTORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RESTORE_PATH.write_text(json.dumps([{"txid": txid, "delta": delta} for txid, delta in deltas]))
+
+
+def _clear_restore() -> None:
+    RESTORE_PATH.unlink(missing_ok=True)
+
+
+def _restore_deltas(url: str, auth: str | None, deltas: list[tuple[str, int]]) -> None:
+    for txid, delta in deltas:
+        _rpc_call(url, auth, "prioritisetransaction", [txid, 0, -delta])
+    _clear_restore()
+
+
+def _restore_file(url: str, auth: str | None) -> None:
+    if not RESTORE_PATH.exists():
+        return
+    try:
+        saved = json.loads(RESTORE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    deltas = [(item["txid"], int(item["delta"])) for item in saved if item.get("txid")]
+    if deltas:
+        _restore_deltas(url, auth, deltas)
+        print(f"restored {len(deltas)} set-aside transactions from the last run", flush=True)
+
+
+def _candidates(second: dict, flags: dict, banned: set[str], have: set[str]) -> tuple[list, int]:
+    ids = [tx["txid"] for tx in second.get("transactions") or []]
+    fresh = []
+    skipped = 0
+    for tx in second.get("transactions") or []:
+        if tx["txid"] in have or tx["txid"] in banned:
+            continue
+        parents = []
+        for dep in tx.get("depends") or []:
+            if isinstance(dep, int) and 1 <= dep <= len(ids):
+                parents.append(ids[dep - 1])
+        try:
+            raw = bytes.fromhex(tx["data"])
+        except (ValueError, TypeError):
+            skipped += 1
+            continue
+        if tx_reject_reason(raw, flags):
+            skipped += 1
+            continue
+        item = dict(tx)
+        item["depends_txids"] = parents
+        fresh.append(item)
+    return fresh, skipped
+
+
+def _assemble(base: dict, transactions: list, source: list) -> dict | None:
+    source_fee = sum(int(tx.get("fee") or 0) for tx in source)
+    final_fee = sum(int(tx.get("fee") or 0) for tx in transactions)
+    value = int(base["coinbasevalue"]) - source_fee + final_fee
+    if value < 0:
+        return None
+    index = {tx["txid"]: i + 1 for i, tx in enumerate(transactions)}
+    cleaned = []
+    for tx in transactions:
+        item = dict(tx)
+        parents = item.pop("depends_txids", None)
+        if parents is not None:
+            item["depends"] = [index[parent] for parent in parents if parent in index]
+        cleaned.append(item)
+    out = dict(base)
+    out["transactions"] = cleaned
+    out["coinbasevalue"] = value
+    out["default_witness_commitment"] = witness_commitment_hex(
+        [tx.get("hash") or tx["txid"] for tx in cleaned]
+    )
+    return out
+
+
+def _refill_round(url: str, auth: str | None, dropped: list[dict]) -> dict | None:
+    deltas: list[tuple[str, int]] = []
+    with _priority_lock:
+        try:
+            _restore_file(url, auth)
+            for tx in dropped:
+                delta = -(int(tx.get("fee") or 0) + 1)
+                _rpc_call(url, auth, "prioritisetransaction", [tx["txid"], 0, delta])
+                deltas.append((tx["txid"], delta))
+            _write_restore(deltas)
+            time.sleep(6)
+            second = _rpc_call(url, auth, "getblocktemplate", [{"rules": ["segwit", "blake2b"]}])
+            return second if isinstance(second, dict) else None
+        finally:
+            if deltas:
+                try:
+                    _restore_deltas(url, auth, deltas)
+                except Exception as exc:
+                    print(f"refill restore failed: {exc}", flush=True)
+
+
+def _refill_worker(cfg: dict, auth: str | None, filtered: dict, original: dict, flags: dict, key: tuple) -> None:
+    name, prevhash, _kept_key = key
+    settled = False
+    try:
+        current = filtered
+        banned = {
+            tx["txid"]
+            for tx in original.get("transactions") or []
+            if tx["txid"] not in {item["txid"] for item in current["transactions"]}
+        }
+        ceilings_weight = weight_ceiling(int(original.get("weightlimit") or 0))
+        size_ceiling = None
+        sigop_ceiling = None
+        if isinstance(original.get("sizelimit"), int):
+            size_ceiling = max(0, original["sizelimit"] - COINBASE_SIZE_RESERVE)
+        if isinstance(original.get("sigoplimit"), int):
+            sigop_ceiling = max(0, original["sigoplimit"] - COINBASE_SIGOP_RESERVE)
+        for _round in range(3):
+            if not banned:
+                settled = True
+                break
+            second = _refill_round(cfg["upstream"], auth, [
+                tx for tx in original.get("transactions") or [] if tx["txid"] in banned
+            ])
+            if not isinstance(second, dict):
+                break
+            if second.get("previousblockhash") != prevhash:
+                print(f"refill tip moved on {name}; stopping", flush=True)
+                settled = True
+                break
+            have = {tx["txid"] for tx in current["transactions"]}
+            candidates, skipped = _candidates(second, flags, banned, have)
+            fresh_ids = {tx["txid"] for tx in candidates}
+            for tx in second.get("transactions") or []:
+                txid = tx.get("txid")
+                if txid and txid not in have and txid not in banned and txid not in fresh_ids:
+                    banned.add(txid)
+            filled_txs = take_refill(
+                current["transactions"],
+                candidates,
+                ceilings_weight,
+                banned,
+                size_ceiling,
+                sigop_ceiling,
+            )
+            added = len(filled_txs) - len(current["transactions"])
+            print(
+                f"refill height {original.get('height')} profile {name} "
+                f"new {len(candidates)} filtered {skipped} added {added}",
+                flush=True,
+            )
+            if added <= 0:
+                settled = True
+                break
+            assembled = _assemble(original, filled_txs, original.get("transactions") or [])
+            if assembled is None or _template_weight(assembled) > ceilings_weight:
+                break
+            _publish(name, prevhash, assembled)
+            current = assembled
+            if _template_weight(assembled) >= ceilings_weight:
+                settled = True
+                break
+    except Exception as exc:
+        print(f"refill failed: {exc}", flush=True)
+        traceback.print_exc()
+    finally:
+        with _state_lock:
+            _inflight.discard(key)
+            if settled:
+                _settled.add(key)
+
+
+def _publish(name: str, prevhash: str, template: dict) -> None:
+    with _state_lock:
+        stale = [item for item in _best if item[0] == name and item[1] != prevhash]
+        for item in stale:
+            _best.pop(item, None)
+        previous = _best.get((name, prevhash))
+        if previous is None or _template_weight(template) >= _template_weight(previous):
+            _best[(name, prevhash)] = template
+
+
+def _schedule_refill(cfg: dict, headers: dict, filtered: dict, original: dict, flags: dict) -> None:
+    prevhash = original.get("previousblockhash")
+    name = cfg.get("name") or ""
+    auth = headers.get("Authorization")
+    if not isinstance(prevhash, str) or not auth:
+        return
+    kept_ids = {tx["txid"] for tx in filtered.get("transactions") or []}
+    dropped = [tx for tx in original.get("transactions") or [] if tx.get("txid") not in kept_ids]
+    if not dropped:
+        return
+    key = (name, prevhash, tuple(tx["txid"] for tx in filtered.get("transactions") or []))
+    with _state_lock:
+        if key in _inflight or key in _settled:
+            return
+        _inflight.add(key)
+    threading.Thread(
+        target=_refill_worker,
+        args=(cfg, auth, filtered, original, flags, key),
+        daemon=True,
+    ).start()
+
+
 def handle_rpc(body: bytes, headers: dict, cfg: dict) -> tuple[int, bytes, str]:
     flags = cfg.get("filters") or {}
     timeout = 30
@@ -171,14 +410,23 @@ def handle_rpc(body: bytes, headers: dict, cfg: dict) -> tuple[int, bytes, str]:
         if "coinbasevalue" not in result:
             return status, raw, ctype
         new_result, info = _filter_template(result, flags)
-        if info.get("dropped"):
-            msg["result"] = new_result
+        served = _choose_template(cfg.get("name") or "", result.get("previousblockhash"), new_result)
+        msg["result"] = served
+        if served is not new_result:
+            print(
+                f"height {result.get('height')} refill served "
+                f"txs {len(served.get('transactions') or [])} "
+                f"weight {_template_weight(served)}",
+                flush=True,
+            )
+        elif info.get("dropped"):
             print(
                 f"height {result.get('height')} dropped {info['dropped']} "
                 f"kept {info['kept']} fee_sats {info['fee_sats']} {info['reasons']}",
                 flush=True,
             )
-            return status, json.dumps(msg).encode(), ctype
+        _schedule_refill(cfg, headers, new_result, result, flags)
+        return status, json.dumps(msg).encode(), ctype
     except Exception as exc:
         print(f"filter fail-open: {exc}", flush=True)
         traceback.print_exc()
@@ -357,11 +605,135 @@ def make_handler(profile_cfg: dict):
     return Handler
 
 
+def _bitcoin_cli(args: list[str], payload: bytes | None = None) -> str:
+    import subprocess
+    cmd = ["sudo", "-n", "docker", "exec"]
+    if payload is not None:
+        cmd.append("-i")
+    cmd += ["knots-local", "bitcoin-cli", "-datadir=/home/bitcoin/.bitcoin"]
+    if payload is not None:
+        cmd.append("-stdin")
+    cmd += args
+    proc = subprocess.run(cmd, input=payload, capture_output=True, timeout=180)
+    if proc.returncode != 0:
+        err = (proc.stderr or b"").decode().strip()
+        raise RuntimeError(err[:300] or f"bitcoin-cli rc {proc.returncode}")
+    return (proc.stdout or b"").decode()
+
+
+def _gbt() -> dict:
+    raw = _bitcoin_cli(["getblocktemplate"], json.dumps({"rules": ["segwit", "blake2b"]}).encode())
+    return json.loads(raw)
+
+
+def fill_once(cfg: dict, profile_name: str = "strict") -> int:
+    """Filter one template, ask the node to refill, and stay under the weight limit.
+
+    Dropped transactions are set aside with prioritisetransaction for the second
+    request, then restored. Nothing is submitted as a block.
+    """
+    profile = _profile(cfg, profile_name)
+    flags = profile.get("filters") or {}
+    first = _gbt()
+    filtered, info = _filter_template(first, flags)
+    kept = filtered["transactions"]
+    kept_ids = {tx["txid"] for tx in kept}
+    dropped = [tx for tx in first["transactions"] if tx["txid"] not in kept_ids]
+    used = sum(int(tx["weight"]) for tx in first["transactions"])
+    limit = int(first["weightlimit"])
+    ceiling = weight_ceiling(limit)
+    print(
+        f"height {first.get('height')} profile {profile.get('name')} "
+        f"txs {len(first['transactions'])} weight {used} limit {limit} ceiling {ceiling}"
+    )
+    print(f"dropped {len(dropped)} weight {sum(int(tx['weight']) for tx in dropped)} reasons {info.get('reasons', {})}")
+    if not dropped:
+        print("nothing to refill")
+        return 0
+    deltas: list[tuple[str, int]] = []
+    second = None
+    try:
+        for tx in dropped:
+            delta = -(int(tx.get("fee") or 0) + 1)
+            _bitcoin_cli(["prioritisetransaction", tx["txid"], "0", str(delta)])
+            deltas.append((tx["txid"], delta))
+        # Knots reuses the last template until the mempool counter changes and
+        # five seconds have passed. Wait before asking for the refill.
+        time.sleep(6)
+        second = _gbt()
+    finally:
+        restored = 0
+        for txid, delta in deltas:
+            try:
+                _bitcoin_cli(["prioritisetransaction", txid, "0", str(-delta)])
+                restored += 1
+            except Exception as exc:
+                print(f"restore failed: {exc}")
+        print(f"restored {restored} of {len(deltas)}")
+    if second is None:
+        return 1
+    if second.get("height") != first.get("height") or second.get("previousblockhash") != first.get("previousblockhash"):
+        print("tip moved during refill; kept the filtered template only")
+        return 0
+    banned = {tx["txid"] for tx in dropped}
+    ids = [tx["txid"] for tx in second["transactions"]]
+    still_there = sum(1 for txid in ids if txid in banned)
+    candidates = []
+    skipped_filter = 0
+    for tx in second["transactions"]:
+        parents = []
+        for dep in tx.get("depends") or []:
+            if isinstance(dep, int) and 1 <= dep <= len(ids):
+                parents.append(ids[dep - 1])
+        if tx["txid"] in kept_ids or tx["txid"] in banned:
+            continue
+        try:
+            raw = bytes.fromhex(tx["data"])
+        except ValueError:
+            skipped_filter += 1
+            continue
+        if tx_reject_reason(raw, flags):
+            skipped_filter += 1
+            continue
+        item = dict(tx)
+        item["depends_txids"] = parents
+        candidates.append(item)
+    print(
+        f"second txs {len(ids)} still_dropped {still_there} "
+        f"new_ok {len(candidates)} new_filtered {skipped_filter}"
+    )
+    filled = take_refill(kept, candidates, ceiling, banned)
+    added = [tx for tx in filled if tx["txid"] not in kept_ids]
+    final_weight = sum(int(tx["weight"]) for tx in filled)
+    added_fee = sum(int(tx.get("fee") or 0) for tx in added)
+    dropped_fee = sum(int(tx.get("fee") or 0) for tx in dropped)
+    value = int(first["coinbasevalue"]) - dropped_fee + added_fee
+    commit = witness_commitment_hex([tx.get("hash") or tx["txid"] for tx in filled])
+    proposal_template = dict(first)
+    proposal_template["transactions"] = filled
+    proposal_template["coinbasevalue"] = value
+    proposal_template["default_witness_commitment"] = commit
+    print(
+        f"added {len(added)} weight {sum(int(tx['weight']) for tx in added)} "
+        f"final {final_weight} under_ceiling {final_weight <= ceiling} coinbase {value}"
+    )
+    verdict = _proposal(proposal_template)
+    print(f"proposal {verdict}")
+    if final_weight > ceiling:
+        return 1
+    if verdict not in ("ok", "null", ""):
+        return 1
+    return 0
+
+
 def main() -> int:
     import threading
     cfg = load_config()
     if len(sys.argv) > 1 and sys.argv[1] == "--check":
         return check(cfg)
+    if len(sys.argv) > 1 and sys.argv[1] == "--fill":
+        profile_name = sys.argv[2] if len(sys.argv) > 2 else "strict"
+        return fill_once(cfg, profile_name)
     servers = []
     for profile in cfg["profiles"]:
         merged = {

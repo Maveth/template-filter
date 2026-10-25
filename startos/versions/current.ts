@@ -1,10 +1,10 @@
 import { VersionInfo } from '@start9labs/start-sdk'
 
 export const current = VersionInfo.of({
-  version: '#filter:0.1.0:2',
+  version: '#filter:0.2.0:0',
   releaseNotes: {
     en_US:
-      'Accept Bitcoin Knots #knots:29.4.2:4 and newer. The previous requirement, >=29, does not match a Knots package.',
+      'After a template is filtered, ask the node to fill the freed space and serve that fuller template on the same tip. The first answer is still the filtered template. A new block starts over. The added transactions stay inside the weight, byte, and sigop limits.',
   },
   migrations: {
     up: async () => {},
