@@ -2,6 +2,16 @@
 
 A block-template filter that sits between a mining gateway and a Bitcoin node. Released under the [MIT license](LICENSE).
 
+## Current status, October 2026
+
+This filter was built to take spam out of a mining template. That spam is not in templates anymore.
+
+Knots 29.4.3 already refuses an OP_RETURN larger than 83 bytes, so those transactions never reach a gateway. On a live node the filter's other spam rules are matching nothing: runes, stamps, Counterparty, fake multisig, and the rest. The only drops left are small OP_RETURN outputs on the strict profile, which refuses every OP_RETURN, and an occasional transaction that fails the bytes-per-sigop rule. The fees in those drops are a few hundred sats, sometimes a couple thousand.
+
+Do not point a gateway at this filter right now. Point the gateway at the node.
+
+When a new kind of spam shows up in templates, a new version of this filter will be released to drop it. The rest of this document is how the filter works, for that version and for anyone who still wants the strict no-OP_RETURN rule.
+
 The node keeps its mempool. The gateway keeps its own block builder. This program only changes the template the gateway asked for.
 
 ## Concept
