@@ -167,6 +167,27 @@ def _choose_template(name: str, prevhash: str | None, filtered: dict) -> dict:
     return best
 
 
+def _with_fresh_clock(served: dict, fresh: dict) -> dict:
+    """Put Knots' current curtime on a saved template.
+
+    The saved list keeps its transactions. The gateway copies curtime into
+    the header, so a saved template has to carry the clock from the template
+    Knots just built. A later clock stays valid for the same transactions.
+    """
+    if served is fresh:
+        return served
+    try:
+        fresh_time = int(fresh.get("curtime") or 0)
+        saved_time = int(served.get("curtime") or 0)
+    except (TypeError, ValueError):
+        return served
+    if fresh_time <= saved_time:
+        return served
+    out = dict(served)
+    out["curtime"] = fresh_time
+    return out
+
+
 def _rpc_call(url: str, auth: str | None, method: str, params: list) -> object:
     body = json.dumps({"jsonrpc": "1.0", "id": "refill", "method": method, "params": params}).encode()
     headers = {"Content-Type": "application/json"}
@@ -432,12 +453,13 @@ def handle_rpc(body: bytes, headers: dict, cfg: dict) -> tuple[int, bytes, str]:
             return status, raw, ctype
         new_result, info = _filter_template(result, flags)
         served = _choose_template(cfg.get("name") or "", result.get("previousblockhash"), new_result)
+        served = _with_fresh_clock(served, new_result)
         msg["result"] = served
         if served is not new_result:
             print(
                 f"height {result.get('height')} refill served "
                 f"txs {len(served.get('transactions') or [])} "
-                f"weight {_template_weight(served)}",
+                f"weight {_template_weight(served)} curtime {served.get('curtime')}",
                 flush=True,
             )
         elif info.get("dropped"):

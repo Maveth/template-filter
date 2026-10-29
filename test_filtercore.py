@@ -4,6 +4,7 @@ import hashlib
 import unittest
 
 from filtercore import clamp_template_request, take_refill, tx_input_outpoints, tx_reject_reason, weight_ceiling, witness_commitment_hex
+import template_filter
 
 FLAGS = {
     "rejectfakeoutputs": True,
@@ -164,6 +165,25 @@ class FilterTests(unittest.TestCase):
         filled = take_refill(kept, child, ceiling=400, banned=set())
         self.assertEqual([tx["txid"] for tx in filled], ["aa", "kid"])
         self.assertEqual(len(tx_input_outpoints(bytes.fromhex(self._spend(prev)))), 1)
+
+
+class FreshClockTest(unittest.TestCase):
+    def test_saved_template_takes_the_newer_clock(self):
+        saved = {"curtime": 100, "transactions": [{"txid": "aa"}], "coinbasevalue": 5}
+        fresh = {"curtime": 250, "transactions": []}
+        out = template_filter._with_fresh_clock(saved, fresh)
+        self.assertEqual(out["curtime"], 250)
+        self.assertEqual(out["transactions"], [{"txid": "aa"}])
+        self.assertEqual(saved["curtime"], 100)
+
+    def test_saved_template_keeps_a_newer_clock(self):
+        saved = {"curtime": 300, "transactions": []}
+        fresh = {"curtime": 250}
+        self.assertIs(template_filter._with_fresh_clock(saved, fresh), saved)
+
+    def test_fresh_template_is_left_alone(self):
+        fresh = {"curtime": 250, "transactions": []}
+        self.assertIs(template_filter._with_fresh_clock(fresh, fresh), fresh)
 
     def test_commitment_shape(self):
         wtxid = "11" * 32

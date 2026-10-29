@@ -1,10 +1,10 @@
 import { VersionInfo } from '@start9labs/start-sdk'
 
 export const current = VersionInfo.of({
-  version: '#filter:0.3.1:0',
+  version: '#filter:0.3.2:0',
   releaseNotes: {
     en_US:
-      'A refill no longer adds a second spend of an input already in the template. The finished list is checked with the node, and a gateway receives it only after that check passes.',
+      'A saved template keeps its transactions and takes the current clock from the node before it is sent to a gateway.',
   },
   migrations: {
     up: async () => {},
