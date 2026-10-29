@@ -3,7 +3,7 @@
 import hashlib
 import unittest
 
-from filtercore import clamp_template_request, take_refill, tx_reject_reason, weight_ceiling, witness_commitment_hex
+from filtercore import clamp_template_request, take_refill, tx_input_outpoints, tx_reject_reason, weight_ceiling, witness_commitment_hex
 
 FLAGS = {
     "rejectfakeoutputs": True,
@@ -133,6 +133,37 @@ class FilterTests(unittest.TestCase):
             [tx["txid"] for tx in take_refill(wide, huge, 100, set(), size_ceiling=20)],
             ["aa"],
         )
+
+    def _spend(self, prev: bytes, vout: int = 0) -> str:
+        raw = b"\x01\x00\x00\x00\x01" + prev + vout.to_bytes(4, "little")
+        raw += b"\x00\xff\xff\xff\xff\x01" + (1000).to_bytes(8, "little") + b"\x00\x00\x00\x00\x00"
+        return raw.hex()
+
+    def test_refill_skips_a_second_spend_of_the_same_input(self):
+        prev = b"\x11" * 32
+        other = b"\x22" * 32
+        kept = [{"txid": "aa", "weight": 100, "data": self._spend(prev)}]
+        candidates = [
+            {"txid": "bb", "weight": 50, "depends_txids": [], "data": self._spend(prev)},
+            {"txid": "cc", "weight": 40, "depends_txids": [], "data": self._spend(other)},
+            {"txid": "dd", "weight": 40, "depends_txids": [], "data": self._spend(other, 1)},
+        ]
+        filled = take_refill(kept, candidates, ceiling=400, banned=set())
+        self.assertEqual([tx["txid"] for tx in filled], ["aa", "cc", "dd"])
+        # Two newcomers that spend one input: only the first stays.
+        fresh = [{"txid": "zz", "weight": 10, "data": self._spend(b"\x33" * 32)}]
+        pair = [
+            {"txid": "bb", "weight": 10, "depends_txids": [], "data": self._spend(b"\x44" * 32)},
+            {"txid": "ee", "weight": 10, "depends_txids": [], "data": self._spend(b"\x44" * 32)},
+        ]
+        filled = take_refill(fresh, pair, ceiling=400, banned=set())
+        self.assertEqual([tx["txid"] for tx in filled], ["zz", "bb"])
+        # A child that spends a different input is still added.
+        child_prev = bytes.fromhex("ab" * 32)
+        child = [{"txid": "kid", "weight": 20, "depends_txids": ["aa"], "data": self._spend(child_prev)}]
+        filled = take_refill(kept, child, ceiling=400, banned=set())
+        self.assertEqual([tx["txid"] for tx in filled], ["aa", "kid"])
+        self.assertEqual(len(tx_input_outpoints(bytes.fromhex(self._spend(prev)))), 1)
 
     def test_commitment_shape(self):
         wtxid = "11" * 32

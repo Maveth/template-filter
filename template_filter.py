@@ -335,6 +335,22 @@ def _refill_worker(cfg: dict, auth: str | None, filtered: dict, original: dict, 
             assembled = _assemble(original, filled_txs, original.get("transactions") or [])
             if assembled is None or _template_weight(assembled) > ceilings_weight:
                 break
+            # The gateway only receives this list after the node has accepted it.
+            verdict = _proposal(assembled)
+            n_tx = len(assembled.get("transactions") or [])
+            if verdict not in ("ok", "null", ""):
+                print(
+                    f"refill height {original.get('height')} profile {name} "
+                    f"node rejected txs {n_tx}: {verdict}",
+                    flush=True,
+                )
+                settled = True
+                break
+            print(
+                f"refill height {original.get('height')} profile {name} "
+                f"node accepted txs {n_tx}",
+                flush=True,
+            )
             _publish(name, prevhash, assembled)
             current = assembled
             if _template_weight(assembled) >= ceilings_weight:

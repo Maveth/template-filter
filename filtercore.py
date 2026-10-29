@@ -419,6 +419,43 @@ def tx_vsize_bytes(tx: dict) -> int:
     return 0
 
 
+def tx_input_outpoints(raw: bytes) -> list[tuple[bytes, int]] | None:
+    """Prevouts this transaction spends. None when the raw tx cannot be read."""
+    if not raw or len(raw) < 10:
+        return None
+    try:
+        off = 4
+        if off + 2 <= len(raw) and raw[off] == 0x00 and raw[off + 1] == 0x01:
+            off += 2
+        vin, off = _read_varint(raw, off)
+        points = []
+        for _ in range(vin):
+            if off + 36 > len(raw):
+                return None
+            prev = raw[off:off + 32]
+            vout = int.from_bytes(raw[off + 32:off + 36], "little")
+            off += 36
+            slen, off = _read_varint(raw, off)
+            if off + slen + 4 > len(raw):
+                return None
+            off += slen + 4
+            points.append((prev, vout))
+        return points
+    except (ValueError, IndexError):
+        return None
+
+
+def _template_outpoints(tx: dict) -> list[tuple[bytes, int]] | None:
+    data = tx.get("data")
+    if not isinstance(data, str) or not data:
+        return None
+    try:
+        raw = bytes.fromhex(data)
+    except ValueError:
+        return None
+    return tx_input_outpoints(raw)
+
+
 def take_refill(
     kept: list,
     candidates: list,
@@ -430,10 +467,18 @@ def take_refill(
     """Append candidates that pass the first filter's ban and still fit.
 
     `candidates` are in the node's order. A candidate is skipped when it was
-    filtered, when a parent is missing, or when it would pass a block limit.
+    filtered, when a parent is missing, when it would pass a block limit, or
+    when it spends an input already spent by a transaction in the template.
+    The second snapshot can contain a higher-fee replacement of a payment the
+    first snapshot already kept. Both must not be in the block.
     """
     have = {tx["txid"] for tx in kept}
     out = list(kept)
+    spent: set[tuple[bytes, int]] = set()
+    for tx in kept:
+        points = _template_outpoints(tx)
+        if points:
+            spent.update(points)
     total = sum(int(tx["weight"]) for tx in kept)
     total_size = sum(tx_vsize_bytes(tx) for tx in kept)
     total_sigops = sum(int(tx.get("sigops") or 0) for tx in kept)
@@ -443,6 +488,12 @@ def take_refill(
             continue
         parents = tx.get("depends_txids") or []
         if any(parent not in have for parent in parents):
+            continue
+        points = _template_outpoints(tx)
+        if points is None and isinstance(tx.get("data"), str) and tx.get("data"):
+            continue
+        if points and any(point in spent for point in points):
+            print(f"refill skipped {txid} spent input already in the template", flush=True)
             continue
         weight = int(tx["weight"])
         size = tx_vsize_bytes(tx)
@@ -455,6 +506,8 @@ def take_refill(
             continue
         out.append(tx)
         have.add(txid)
+        if points:
+            spent.update(points)
         total += weight
         total_size += size
         total_sigops += sigops
