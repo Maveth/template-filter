@@ -29,6 +29,8 @@ COINBASE_SIGOP_RESERVE = 400
 _state_lock = threading.Lock()
 _priority_lock = threading.Lock()
 _best: dict[tuple, dict] = {}
+# A saved list at the weight cap would otherwise sit for the whole block.
+SAVED_MAX_AGE_S = 120
 _inflight: set[tuple] = set()
 _settled: set[tuple] = set()
 
@@ -157,11 +159,26 @@ def _template_weight(result: dict) -> int:
     return sum(int(tx.get("weight") or 0) for tx in result.get("transactions") or [])
 
 
+def _saved_is_fresh(template: dict, now: float | None = None) -> bool:
+    """A saved list is usable for two minutes after the node accepted it."""
+    try:
+        saved_at = float(template.get("_saved_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    return (time.time() if now is None else now) - saved_at <= SAVED_MAX_AGE_S
+
+
 def _choose_template(name: str, prevhash: str | None, filtered: dict) -> dict:
     if not prevhash:
         return filtered
     with _state_lock:
         best = _best.get((name, prevhash))
+        if best is not None and not _saved_is_fresh(best):
+            _best.pop((name, prevhash), None)
+            stale = [key for key in _settled if key[0] == name and key[1] == prevhash]
+            for key in stale:
+                _settled.discard(key)
+            best = None
     if best is None or _template_weight(best) < _template_weight(filtered):
         return filtered
     return best
@@ -185,6 +202,15 @@ def _with_fresh_clock(served: dict, fresh: dict) -> dict:
         return served
     out = dict(served)
     out["curtime"] = fresh_time
+    return out
+
+
+def _for_gateway(template: dict) -> dict:
+    """The saved-at mark stays in the cache. It is not part of the template."""
+    if "_saved_at" not in template:
+        return template
+    out = dict(template)
+    out.pop("_saved_at", None)
     return out
 
 
@@ -394,7 +420,9 @@ def _publish(name: str, prevhash: str, template: dict) -> None:
             _best.pop(item, None)
         previous = _best.get((name, prevhash))
         if previous is None or _template_weight(template) >= _template_weight(previous):
-            _best[(name, prevhash)] = template
+            stored = dict(template)
+            stored["_saved_at"] = time.time()
+            _best[(name, prevhash)] = stored
 
 
 def _schedule_refill(cfg: dict, headers: dict, filtered: dict, original: dict, flags: dict) -> None:
@@ -454,6 +482,7 @@ def handle_rpc(body: bytes, headers: dict, cfg: dict) -> tuple[int, bytes, str]:
         new_result, info = _filter_template(result, flags)
         served = _choose_template(cfg.get("name") or "", result.get("previousblockhash"), new_result)
         served = _with_fresh_clock(served, new_result)
+        served = _for_gateway(served)
         msg["result"] = served
         if served is not new_result:
             print(

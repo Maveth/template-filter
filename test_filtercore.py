@@ -185,6 +185,21 @@ class FreshClockTest(unittest.TestCase):
         fresh = {"curtime": 250, "transactions": []}
         self.assertIs(template_filter._with_fresh_clock(fresh, fresh), fresh)
 
+    def test_saved_list_expires_after_two_minutes(self):
+        now = 1_000.0
+        fresh = {"_saved_at": now, "transactions": []}
+        old = {"_saved_at": now - 121, "transactions": []}
+        self.assertTrue(template_filter._saved_is_fresh(fresh, now))
+        self.assertFalse(template_filter._saved_is_fresh(old, now))
+        self.assertFalse(template_filter._saved_is_fresh({}, now))
+
+    def test_saved_at_is_not_sent_to_the_gateway(self):
+        saved = {"curtime": 10, "_saved_at": 1.0, "transactions": [{"txid": "aa"}]}
+        out = template_filter._for_gateway(saved)
+        self.assertNotIn("_saved_at", out)
+        self.assertEqual(out["transactions"], [{"txid": "aa"}])
+        self.assertIn("_saved_at", saved)
+
     def test_commitment_shape(self):
         wtxid = "11" * 32
         commit = witness_commitment_hex([wtxid])

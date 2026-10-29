@@ -8,7 +8,7 @@ This filter was built to take spam out of a mining template. That spam is not in
 
 Knots 29.4.3 already refuses an OP_RETURN larger than 83 bytes, so those transactions never reach a gateway. On a live node the filter's other spam rules are matching nothing: runes, stamps, Counterparty, fake multisig, and the rest. The only drops left are small OP_RETURN outputs on the strict profile, which refuses every OP_RETURN, and an occasional transaction that fails the bytes-per-sigop rule. The fees in those drops are a few hundred sats, sometimes a couple thousand.
 
-Do not point a gateway at this filter right now. Point the gateway at the node.
+Do not point a gateway at this filter right now. Point the gateway at the node. The code is still maintained: a saved template expires after two minutes and the next list is refilled from the node, then sent only after the node accepts it.
 
 When a new kind of spam shows up in templates, a new version of this filter will be released to drop it. The rest of this document is how the filter works, for that version and for anyone who still wants the strict no-OP_RETURN rule.
 
