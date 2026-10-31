@@ -456,6 +456,72 @@ def _template_outpoints(tx: dict) -> list[tuple[bytes, int]] | None:
     return tx_input_outpoints(raw)
 
 
+def _tx_fee(tx: dict) -> int:
+    try:
+        return int(tx.get("fee") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _spends_removed(tx: dict, removed: set[str]) -> bool:
+    """True when this transaction spends one we are taking out of the template."""
+    if any(parent in removed for parent in (tx.get("depends_txids") or [])):
+        return True
+    points = _template_outpoints(tx)
+    if not points:
+        return False
+    hashes: set[bytes] = set()
+    for parent in removed:
+        try:
+            raw = bytes.fromhex(parent)
+        except ValueError:
+            continue
+        if len(raw) == 32:
+            hashes.add(raw)
+            hashes.add(bytes(reversed(raw)))
+    return any(prev in hashes for prev, _vout in points)
+
+
+def _without(txs: list, gone: set[str]) -> list:
+    return [tx for tx in txs if tx["txid"] not in gone]
+
+
+def _measure(txs: list) -> tuple[set[str], dict[tuple[bytes, int], str], int, int, int]:
+    have: set[str] = set()
+    owner: dict[tuple[bytes, int], str] = {}
+    total = total_size = total_sigops = 0
+    for tx in txs:
+        have.add(tx["txid"])
+        points = _template_outpoints(tx)
+        if points:
+            for point in points:
+                owner[point] = tx["txid"]
+        total += int(tx["weight"])
+        total_size += tx_vsize_bytes(tx)
+        total_sigops += int(tx.get("sigops") or 0)
+    return have, owner, total, total_size, total_sigops
+
+
+def _fits(
+    total: int,
+    total_size: int,
+    total_sigops: int,
+    weight: int,
+    size: int,
+    sigops: int,
+    ceiling: int,
+    size_ceiling: int | None,
+    sigop_ceiling: int | None,
+) -> bool:
+    if total + weight > ceiling:
+        return False
+    if size_ceiling is not None and total_size + size > size_ceiling:
+        return False
+    if sigop_ceiling is not None and total_sigops + sigops > sigop_ceiling:
+        return False
+    return True
+
+
 def take_refill(
     kept: list,
     candidates: list,
@@ -467,21 +533,25 @@ def take_refill(
     """Append candidates that pass the first filter's ban and still fit.
 
     `candidates` are in the node's order. A candidate is skipped when it was
-    filtered, when a parent is missing, when it would pass a block limit, or
-    when it spends an input already spent by a transaction in the template.
-    The second snapshot can contain a higher-fee replacement of a payment the
-    first snapshot already kept. Both must not be in the block.
+    filtered, when a parent is missing, or when it would pass a block limit
+    even after making room.
+
+    A later snapshot can carry a replace-by-fee of a transaction the first
+    snapshot kept. That replacement takes the input. The old transaction and
+    anything that spends it leave. Lower-fee transactions are dropped when
+    the replacement needs the room. Two newcomers that spend one input keep
+    the first, which is the node's order. The caller checks the finished
+    list with the node before a gateway receives it.
     """
-    have = {tx["txid"] for tx in kept}
+    original = {tx["txid"] for tx in kept}
     out = list(kept)
-    spent: set[tuple[bytes, int]] = set()
-    for tx in kept:
-        points = _template_outpoints(tx)
-        if points:
-            spent.update(points)
-    total = sum(int(tx["weight"]) for tx in kept)
-    total_size = sum(tx_vsize_bytes(tx) for tx in kept)
-    total_sigops = sum(int(tx.get("sigops") or 0) for tx in kept)
+    have, owner, total, total_size, total_sigops = _measure(out)
+
+    def _commit(txs: list) -> None:
+        nonlocal out, have, owner, total, total_size, total_sigops
+        out = txs
+        have, owner, total, total_size, total_sigops = _measure(out)
+
     for tx in candidates:
         txid = tx["txid"]
         if txid in have or txid in banned:
@@ -492,23 +562,70 @@ def take_refill(
         points = _template_outpoints(tx)
         if points is None and isinstance(tx.get("data"), str) and tx.get("data"):
             continue
-        if points and any(point in spent for point in points):
-            print(f"refill skipped {txid} spent input already in the template", flush=True)
-            continue
         weight = int(tx["weight"])
         size = tx_vsize_bytes(tx)
         sigops = int(tx.get("sigops") or 0)
-        if total + weight > ceiling:
+        conflicting = {owner[point] for point in points or [] if point in owner}
+        newcomers = conflicting - original
+        if newcomers:
+            print(f"refill skipped {txid} spent input already taken by {','.join(sorted(newcomers))}", flush=True)
             continue
-        if size_ceiling is not None and total_size + size > size_ceiling:
+        base = out
+        if conflicting:
+            gone = set(conflicting)
+            changed = True
+            while changed:
+                changed = False
+                for old in base:
+                    if old["txid"] in gone:
+                        continue
+                    if _spends_removed(old, gone):
+                        gone.add(old["txid"])
+                        changed = True
+            base = _without(base, gone)
+            if any(parent not in {item["txid"] for item in base} for parent in parents):
+                continue
+        trial = list(base)
+        have_t, owner_t, total_t, size_t, sig_t = _measure(trial)
+        kicked: list[set[str]] = []
+        if conflicting:
+            protected = set(parents)
+            stack = list(parents)
+            while stack:
+                pid = stack.pop()
+                if pid in protected and pid not in parents:
+                    continue
+                protected.add(pid)
+                for item in trial:
+                    if item["txid"] == pid:
+                        stack.extend(item.get("depends_txids") or [])
+            while not _fits(total_t, size_t, sig_t, weight, size, sigops, ceiling, size_ceiling, sigop_ceiling):
+                victims = [
+                    item for item in trial
+                    if item["txid"] not in protected and _tx_fee(item) < _tx_fee(tx)
+                ]
+                if not victims:
+                    break
+                victim = min(victims, key=_tx_fee)
+                drop = {victim["txid"]}
+                changed = True
+                while changed:
+                    changed = False
+                    for item in trial:
+                        if item["txid"] in drop or item["txid"] in protected:
+                            continue
+                        if _spends_removed(item, drop):
+                            drop.add(item["txid"])
+                            changed = True
+                trial = _without(trial, drop)
+                have_t, owner_t, total_t, size_t, sig_t = _measure(trial)
+                kicked.append(drop)
+        if not _fits(total_t, size_t, sig_t, weight, size, sigops, ceiling, size_ceiling, sigop_ceiling):
             continue
-        if sigop_ceiling is not None and total_sigops + sigops > sigop_ceiling:
-            continue
-        out.append(tx)
-        have.add(txid)
-        if points:
-            spent.update(points)
-        total += weight
-        total_size += size
-        total_sigops += sigops
+        if conflicting:
+            print(f"refill replaced {','.join(sorted(conflicting))} with {txid}", flush=True)
+        for drop in kicked:
+            print(f"refill dropped {','.join(sorted(drop))} to fit {txid}", flush=True)
+        trial.append(tx)
+        _commit(trial)
     return out

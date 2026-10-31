@@ -150,7 +150,32 @@ class FilterTests(unittest.TestCase):
             {"txid": "dd", "weight": 40, "depends_txids": [], "data": self._spend(other, 1)},
         ]
         filled = take_refill(kept, candidates, ceiling=400, banned=set())
-        self.assertEqual([tx["txid"] for tx in filled], ["aa", "cc", "dd"])
+        self.assertEqual([tx["txid"] for tx in filled], ["bb", "cc", "dd"])
+        # The replacement is heavier than the transaction it retires. A
+        # lower-fee neighbor is dropped so the replacement fits.
+        crowded = [
+            {"txid": "aa", "weight": 100, "fee": 10, "data": self._spend(prev)},
+            {"txid": "low", "weight": 50, "fee": 1, "data": self._spend(b"\x55" * 32)},
+        ]
+        replacement = [{
+            "txid": "bb",
+            "weight": 80,
+            "fee": 100,
+            "depends_txids": [],
+            "data": self._spend(prev),
+        }]
+        filled = take_refill(crowded, replacement, ceiling=120, banned=set())
+        self.assertEqual([tx["txid"] for tx in filled], ["bb"])
+        # Too big even after the old spend and the cheap neighbor are gone.
+        huge = [{
+            "txid": "bb",
+            "weight": 200,
+            "fee": 100,
+            "depends_txids": [],
+            "data": self._spend(prev),
+        }]
+        filled = take_refill(crowded, huge, ceiling=120, banned=set())
+        self.assertEqual([tx["txid"] for tx in filled], ["aa", "low"])
         # Two newcomers that spend one input: only the first stays.
         fresh = [{"txid": "zz", "weight": 10, "data": self._spend(b"\x33" * 32)}]
         pair = [
@@ -164,6 +189,18 @@ class FilterTests(unittest.TestCase):
         child = [{"txid": "kid", "weight": 20, "depends_txids": ["aa"], "data": self._spend(child_prev)}]
         filled = take_refill(kept, child, ceiling=400, banned=set())
         self.assertEqual([tx["txid"] for tx in filled], ["aa", "kid"])
+        # A child of the transaction being replaced cannot stay.
+        kept_child = [
+            {"txid": "aa", "weight": 100, "fee": 5, "data": self._spend(prev)},
+            {"txid": "kid", "weight": 20, "fee": 1, "depends_txids": ["aa"], "data": self._spend(b"\x66" * 32)},
+        ]
+        filled = take_refill(
+            kept_child,
+            [{"txid": "bb", "weight": 50, "fee": 20, "depends_txids": [], "data": self._spend(prev)}],
+            ceiling=400,
+            banned=set(),
+        )
+        self.assertEqual([tx["txid"] for tx in filled], ["bb"])
         self.assertEqual(len(tx_input_outpoints(bytes.fromhex(self._spend(prev)))), 1)
 
 
