@@ -370,13 +370,18 @@ def _refill_worker(cfg: dict, auth: str | None, filtered: dict, original: dict, 
                 size_ceiling,
                 sigop_ceiling,
             )
+            old_ids = [tx.get("txid") for tx in current["transactions"]]
+            new_ids = [tx.get("txid") for tx in filled_txs]
             added = len(filled_txs) - len(current["transactions"])
             print(
                 f"refill height {original.get('height')} profile {name} "
                 f"new {len(candidates)} filtered {skipped} added {added}",
                 flush=True,
             )
-            if added <= 0:
+            # A replacement can keep the same count, or shrink it when a
+            # child or a lower-fee transaction is removed. Same txids means
+            # nothing changed.
+            if new_ids == old_ids:
                 settled = True
                 break
             assembled = _assemble(original, filled_txs, original.get("transactions") or [])
