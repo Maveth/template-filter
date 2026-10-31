@@ -362,50 +362,68 @@ def _refill_worker(cfg: dict, auth: str | None, filtered: dict, original: dict, 
                 txid = tx.get("txid")
                 if txid and txid not in have and txid not in banned and txid not in fresh_ids:
                     banned.add(txid)
-            filled_txs = take_refill(
-                current["transactions"],
-                candidates,
-                ceilings_weight,
-                banned,
-                size_ceiling,
-                sigop_ceiling,
-            )
-            old_ids = [tx.get("txid") for tx in current["transactions"]]
-            new_ids = [tx.get("txid") for tx in filled_txs]
-            added = len(filled_txs) - len(current["transactions"])
-            print(
-                f"refill height {original.get('height')} profile {name} "
-                f"new {len(candidates)} filtered {skipped} added {added}",
-                flush=True,
-            )
-            # A replacement can keep the same count, or shrink it when a
-            # child or a lower-fee transaction is removed. Same txids means
-            # nothing changed.
-            if new_ids == old_ids:
-                settled = True
-                break
-            assembled = _assemble(original, filled_txs, original.get("transactions") or [])
-            if assembled is None or _template_weight(assembled) > ceilings_weight:
-                break
-            # The gateway only receives this list after the node has accepted it.
-            verdict = _proposal(assembled)
-            n_tx = len(assembled.get("transactions") or [])
-            if verdict not in ("ok", "null", ""):
+            # The list already filled is `current`. A node rejection drops
+            # only the new transaction and the same list is checked again.
+            pool = list(candidates)
+            accepted = False
+            for _drop_try in range(8):
+                filled_txs = take_refill(
+                    current["transactions"],
+                    pool,
+                    ceilings_weight,
+                    banned,
+                    size_ceiling,
+                    sigop_ceiling,
+                )
+                old_ids = [tx.get("txid") for tx in current["transactions"]]
+                new_ids = [tx.get("txid") for tx in filled_txs]
+                added = len(filled_txs) - len(current["transactions"])
+                print(
+                    f"refill height {original.get('height')} profile {name} "
+                    f"new {len(pool)} filtered {skipped} added {added}",
+                    flush=True,
+                )
+                # A replacement can keep the same count, or shrink it when a
+                # child or a lower-fee transaction is removed. Same txids means
+                # nothing changed.
+                if new_ids == old_ids:
+                    settled = True
+                    break
+                assembled = _assemble(original, filled_txs, original.get("transactions") or [])
+                if assembled is None or _template_weight(assembled) > ceilings_weight:
+                    break
+                verdict = _proposal(assembled)
+                n_tx = len(assembled.get("transactions") or [])
+                if verdict in ("ok", "null", ""):
+                    print(
+                        f"refill height {original.get('height')} profile {name} "
+                        f"node accepted txs {n_tx}",
+                        flush=True,
+                    )
+                    _publish(name, prevhash, assembled)
+                    current = assembled
+                    accepted = True
+                    break
+                added_ids = [txid for txid in new_ids if txid not in set(old_ids)]
+                drop_id = next((txid for txid in added_ids if txid and txid in verdict), None)
+                if drop_id is None and added_ids:
+                    drop_id = added_ids[-1]
                 print(
                     f"refill height {original.get('height')} profile {name} "
                     f"node rejected txs {n_tx}: {verdict}",
                     flush=True,
                 )
+                if not drop_id:
+                    break
+                print(f"refill drop {drop_id} and recheck", flush=True)
+                banned.add(drop_id)
+                pool = [item for item in pool if item.get("txid") != drop_id]
+            if settled:
+                break
+            if not accepted:
                 settled = True
                 break
-            print(
-                f"refill height {original.get('height')} profile {name} "
-                f"node accepted txs {n_tx}",
-                flush=True,
-            )
-            _publish(name, prevhash, assembled)
-            current = assembled
-            if _template_weight(assembled) >= ceilings_weight:
+            if _template_weight(current) >= ceilings_weight:
                 settled = True
                 break
     except Exception as exc:
